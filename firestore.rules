@@ -1,0 +1,173 @@
+rules_version = '2';
+
+// Security rules for Hunt. The client never has to be trusted for:
+//   * who can see hider locations (hunters only)
+//   * catching (hunter must present the hider's secret QR token)
+//   * pinging outside the hunting phase or as someone else
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function roomPath(code) { return /databases/$(database)/documents/rooms/$(code); }
+    function roomData(code) { return get(roomPath(code)).data; }
+    function playerPath(code, uid) { return /databases/$(database)/documents/rooms/$(code)/players/$(uid); }
+    function isMember(code) { return exists(playerPath(code, request.auth.uid)); }
+    function isHost(code) { return roomData(code).hostId == request.auth.uid; }
+    function isHunter(code) { return request.auth.uid in roomData(code).hunterIds; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // Phase maths mirrored from src/lib/game.ts. 5s tolerance for phone clock drift.
+    function nowMs() { return request.time.toMillis(); }
+    function huntStart(r) { return r.startedAt + r.settings.hideSeconds * 1000; }
+    function huntEnd(r) { return huntStart(r) + r.settings.durationMinutes * 60000; }
+    function inHunt(r) {
+      return r.status == 'active'
+        && nowMs() >= huntStart(r) - 5000
+        && nowMs() < huntEnd(r) + 5000;
+    }
+    function secret(code, uid) { return get(/databases/$(database)/documents/rooms/$(code)/secrets/$(uid)).data; }
+    function validName(n) { return n is string && n.size() >= 1 && n.size() <= 20; }
+
+    match /rooms/{code} {
+      // Anyone signed in can look a room up by its code (needed to join). No listing.
+      allow get: if signedIn();
+      allow list: if false;
+
+      allow create: if signedIn()
+        && code.matches('^[A-Z2-9]{5}$')
+        && request.resource.data.hostId == request.auth.uid
+        && request.resource.data.status == 'lobby'
+        && request.resource.data.hunterIds == []
+        && request.resource.data.startedAt == null;
+
+      allow update: if signedIn() && (
+        (isHost(code) && hostUpdate())
+        // A hunter catches a hider: decrement hidersLeft by exactly one, naming the player
+        // whose status flips active -> caught in the same batch.
+        || (isHunter(code)
+            && resource.data.status == 'active'
+            && changed().hasOnly(['hidersLeft', 'lastCaught'])
+            && request.resource.data.hidersLeft == resource.data.hidersLeft - 1
+            && get(playerPath(code, request.resource.data.lastCaught)).data.status == 'active'
+            && getAfter(playerPath(code, request.resource.data.lastCaught)).data.status == 'caught')
+        // A hunter may declare victory once no hiders are left.
+        || (isHunter(code)
+            && resource.data.status == 'active'
+            && resource.data.hidersLeft == 0
+            && request.resource.data.status == 'ended'
+            && request.resource.data.winner == 'hunter'
+            && changed().hasOnly(['status', 'winner', 'endedAt']))
+        // Any player may mark the game over once time has run out.
+        || (isMember(code)
+            && resource.data.status == 'active'
+            && nowMs() >= huntEnd(resource.data) - 5000
+            && request.resource.data.status == 'ended'
+            && request.resource.data.winner == 'hiders'
+            && changed().hasOnly(['status', 'winner', 'endedAt']))
+      );
+
+      // The host may only make these transitions.
+      function hostUpdate() {
+        let before = resource.data.status;
+        let after = request.resource.data.status;
+        return request.resource.data.hostId == resource.data.hostId && (
+          // Edit rules in the lobby.
+          (before == 'lobby' && after == 'lobby' && changed().hasOnly(['settings']))
+          // Start: pick hunters, stamp the start time.
+          || (before == 'lobby' && after == 'active'
+              && changed().hasOnly(['status', 'hunterIds', 'startedAt', 'endedAt', 'winner', 'hidersLeft', 'lastCaught'])
+              && request.resource.data.hunterIds.size() >= 1
+              && request.resource.data.hidersLeft >= 1
+              && request.resource.data.startedAt > nowMs() - 60000
+              && request.resource.data.startedAt < nowMs() + 60000)
+          // End the game early / record a result.
+          || (before == 'active' && after == 'ended'
+              && changed().hasOnly(['status', 'winner', 'endedAt']))
+          // Back to the lobby for another round (also aborts a running game).
+          || ((before == 'active' || before == 'ended') && after == 'lobby'
+              && changed().hasOnly(['status', 'hunterIds', 'startedAt', 'endedAt', 'winner', 'hidersLeft', 'lastCaught'])
+              && request.resource.data.hunterIds == []
+              && request.resource.data.startedAt == null)
+        );
+      }
+
+      allow delete: if false;
+
+      match /players/{uid} {
+        // Members see everyone; anyone can check their own (possibly missing) entry when joining.
+        allow read: if signedIn() && (request.auth.uid == uid || isMember(code));
+
+        allow create: if signedIn()
+          && request.auth.uid == uid
+          && roomData(code).status == 'lobby'
+          && validName(request.resource.data.name)
+          && request.resource.data.role == 'hider'
+          && request.resource.data.status == 'active';
+
+        allow update: if signedIn() && (
+          // Rename yourself.
+          (request.auth.uid == uid
+            && changed().hasOnly(['name'])
+            && validName(request.resource.data.name))
+          // Host assigns roles / resets players when starting or restarting a round.
+          || (isHost(code)
+            && (roomData(code).status == 'lobby' || getAfter(roomPath(code)).data.status == 'lobby')
+            && changed().hasOnly(['role', 'status', 'caughtAt', 'caughtBy', 'catchToken']))
+          // Hunter catches a hider by scanning their QR (contains the hider's secret token for
+          // this round), and decrements the room's hidersLeft in the same batch.
+          || (isHunter(code)
+            && inHunt(roomData(code))
+            && resource.data.role == 'hider'
+            && resource.data.status == 'active'
+            && request.resource.data.status == 'caught'
+            && request.resource.data.caughtBy == request.auth.uid
+            && changed().hasOnly(['status', 'caughtAt', 'caughtBy', 'catchToken'])
+            && request.resource.data.catchToken == secret(code, uid).token
+            && secret(code, uid).round == roomData(code).startedAt
+            && getAfter(roomPath(code)).data.lastCaught == uid
+            && getAfter(roomPath(code)).data.hidersLeft == roomData(code).hidersLeft - 1)
+        );
+
+        // Leave the lobby, or the host removes someone from the lobby.
+        allow delete: if signedIn()
+          && roomData(code).status == 'lobby'
+          && (request.auth.uid == uid || isHost(code));
+      }
+
+      // Each player's catch token, shown as their QR code. Only the owner can read it.
+      // It can be (re)written freely in the lobby, but during a game only rotated once,
+      // to the current round, so a hider can't invalidate the code they're showing.
+      match /secrets/{uid} {
+        function owner() { return signedIn() && request.auth.uid == uid && isMember(code); }
+        function forThisRound() { return request.resource.data.round == roomData(code).startedAt; }
+        allow read: if owner();
+        allow create: if owner() && (roomData(code).status == 'lobby' || forThisRound());
+        allow update: if owner() && (
+          roomData(code).status == 'lobby'
+          || (resource.data.round != roomData(code).startedAt && forThisRound()));
+        allow delete: if false;
+      }
+
+      match /pings/{pingId} {
+        allow create: if signedIn()
+          && request.resource.data.playerId == request.auth.uid
+          && inHunt(roomData(code))
+          && get(playerPath(code, request.auth.uid)).data.status == 'active'
+          && request.resource.data.role == get(playerPath(code, request.auth.uid)).data.role
+          && request.resource.data.lat is number
+          && request.resource.data.lng is number
+          && request.resource.data.at is number
+          && request.resource.data.at > nowMs() - 120000
+          && request.resource.data.at < nowMs() + 120000;
+
+        // Hunters see everything. Hiders only see hunter pings, and only if the host enabled it.
+        allow read: if signedIn() && isMember(code) && (
+          isHunter(code)
+          || (resource.data.role == 'hunter' && roomData(code).settings.revealHunter == true)
+        );
+
+        allow update, delete: if false;
+      }
+    }
+  }
+}
